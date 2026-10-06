@@ -1,0 +1,32 @@
+{
+  "mode": "paper",
+  "database": "data/prediction.sqlite",
+  "max_contract_ask": 0.75,
+  "max_contract_spread": 0.04,
+  "assets": {
+    "BTC": {
+      "series": "KXBTC15M",
+      "rules_sha256": "ed2065e6ca514010208fbfcbb05b1448053bd9b9844611bf508996e109469846",
+      "rules_verified": true,
+      "reference_index": "BRTI",
+      "yes_direction": "UP",
+      "tie": "UP",
+      "expiry_field": "close_time",
+      "target_field": "floor_strike",
+      "rules_url": "https://kalshi.com/markets/kxbtc15m",
+      "fee_per_contract": 0.02
+    },
+    "ETH": {
+      "series": "KXETH15M",
+      "rules_sha256": "fe071b962185177286b0b2200d36bed916e6f3d378c9b133b112be87c2681c92",
+      "rules_verified": true,
+      "reference_index": "ETHUSD_RTI",
+      "yes_direction": "UP",
+      "tie": "UP",
+      "expiry_field": "close_time",
+      "target_field": "floor_strike",
+      "rules_url": "https://kalshi.com/markets/kxeth15m",
+      "fee_per_contract": 0.02
+    }
+  }
+}

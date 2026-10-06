@@ -1,0 +1,15 @@
+[Unit]
+Description=Coinbase BTC ETH 15M Telegram Signal Bot
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/root/Crypto-Signal-Bot.
+ExecStart=/root/Crypto-Signal-Bot./.venv/bin/python -u -m scanner.btc_eth_15m_signal --env /root/Crypto-Signal-Bot./.env --interval 20
+Restart=always
+RestartSec=10
+Environment=PYTHONUNBUFFERED=1
+
+[Install]
+WantedBy=multi-user.target

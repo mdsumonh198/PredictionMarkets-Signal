@@ -1,0 +1,32 @@
+{
+  "mode": "paper",
+  "database": "data/prediction.sqlite",
+  "max_contract_ask": 0.75,
+  "max_contract_spread": 0.04,
+  "assets": {
+    "BTC": {
+      "series": "",
+      "rules_sha256": "",
+      "rules_verified": false,
+      "reference_index": "BRTI",
+      "yes_direction": "UP",
+      "tie": "UP",
+      "expiry_field": "close_time",
+      "target_field": "floor_strike",
+      "rules_url": "",
+      "fee_per_contract": 0.02
+    },
+    "ETH": {
+      "series": "",
+      "rules_sha256": "",
+      "rules_verified": false,
+      "reference_index": "ETHUSD_RTI",
+      "yes_direction": "UP",
+      "tie": "UP",
+      "expiry_field": "close_time",
+      "target_field": "floor_strike",
+      "rules_url": "",
+      "fee_per_contract": 0.02
+    }
+  }
+}

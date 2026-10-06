@@ -1,0 +1,32 @@
+{
+  "BTC": {
+    "contract": {
+      "asset": "BTC",
+      "contract_id": "KXBTC15M-26OCT060330-30",
+      "reference_index": "BRTI",
+      "rules_url": "https://kalshi.com/markets/kxbtc15m",
+      "start": 1791270900.0,
+      "expiry": 1791271800.0,
+      "target": 85335.33,
+      "settlement": "final_60_seconds_average"
+    },
+    "rules_primary": "If the simple average of the sixty seconds of CF Benchmarks' BRTI before 3:30 AM EDT on Oct 6, 2026 is at least the simple average of the sixty seconds of CF Benchmarks' BRTI before 3:15 AM EDT on October 6, 2026, then the market resolves to Yes.",
+    "rules_secondary": "Not all cryptocurrency price data is the same. While checking a source like Google or Coinbase may help guide your decision, the price used to determine this market is based on CF Benchmarks' corresponding Real Time Index (RTI). At the last minute before expiration, 60 RTI prices are collected. The official and final value is the average of these prices, rounded to the nearest 2 decimal places.",
+    "retrieved_at": 1791271598.770653
+  },
+  "ETH": {
+    "contract": {
+      "asset": "ETH",
+      "contract_id": "KXETH15M-26OCT060330-30",
+      "reference_index": "ETHUSD_RTI",
+      "rules_url": "https://kalshi.com/markets/kxeth15m",
+      "start": 1791270900.0,
+      "expiry": 1791271800.0,
+      "target": 2697.07,
+      "settlement": "final_60_seconds_average"
+    },
+    "rules_primary": "If the simple average of the sixty seconds of CF Benchmarks' ETHUSDRTI before 3:30 AM EDT on Oct 6, 2026 is at least the simple average of the sixty seconds of CF Benchmarks' ETHUSDRTI before 3:15 AM EDT on October 6, 2026, then the market resolves to Yes.",
+    "rules_secondary": "Not all cryptocurrency price data is the same. While checking a source like Google or Coinbase may help guide your decision, the price used to determine this market is based on CF Benchmarks' corresponding Real Time Index (RTI). At the last minute before expiration, 60 RTI prices are collected. The official and final value is the average of these prices, rounded to the nearest 2 decimal places.",
+    "retrieved_at": 1791271598.770653
+  }
+}

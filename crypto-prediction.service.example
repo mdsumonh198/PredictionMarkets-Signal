@@ -1,0 +1,18 @@
+[Unit]
+Description=BTC ETH Prediction Paper Monitor
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/root/Crypto-Signal-Bot.
+EnvironmentFile=/root/.config/crypto-prediction/prediction.env
+ExecStart=/root/Crypto-Signal-Bot./.venv/bin/python -u -m scanner.prediction_bot --provider kalshi --config /root/.config/crypto-prediction/config.json --notify
+Restart=on-failure
+RestartSec=15
+TimeoutStopSec=15
+Environment=PYTHONUNBUFFERED=1
+UMask=0077
+
+[Install]
+WantedBy=multi-user.target
