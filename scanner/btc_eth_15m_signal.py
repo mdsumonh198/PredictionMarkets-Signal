@@ -1,7 +1,8 @@
-"""BTC/ETH 15-minute directional research signals from public Coinbase spot data.
+"""Kalshi-native BTC/ETH 15-minute prediction-market Telegram signals.
 
-Monitors each 15m window and sends at most one Telegram signal per asset during
-minutes 13-15. Signal only; never places an order.
+Public market data only. Sends an EARLY signal near T-3m, a FINAL signal near
+T-1m as a reply, then replies with the official Kalshi settlement result.
+No orders are placed and no Kalshi account/API key is required for these REST reads.
 """
 import argparse
 import json
@@ -10,119 +11,134 @@ import math
 import os
 import sqlite3
 import time
+from datetime import datetime, timezone
 from pathlib import Path
+from urllib.parse import urlencode
+from urllib.request import Request, urlopen
 
-from scanner.market_data.coinbase import Coinbase
 from scanner.notifications.telegram import Telegram
 
-TF = 900
-ASSETS = ("BTC-USD", "ETH-USD")
+BASE = "https://external-api.kalshi.com/trade-api/v2"
+SERIES = {"BTC": "KXBTC15M", "ETH": "KXETH15M"}
 
 
-def ema(values, period):
-    if not values:
-        return math.nan
-    a = 2.0 / (period + 1)
-    out = values[0]
-    for v in values[1:]:
-        out = a * v + (1 - a) * out
-    return out
+def _f(v, default=0.0):
+    try: return float(v)
+    except (TypeError, ValueError): return default
 
 
-def rsi(values, period=14):
-    if len(values) < period + 1:
-        return math.nan
-    gains, losses = [], []
-    for a, b in zip(values[-period-1:-1], values[-period:]):
-        d = b - a
-        gains.append(max(d, 0)); losses.append(max(-d, 0))
-    ag, al = sum(gains)/period, sum(losses)/period
-    if al == 0:
-        return 100.0
-    return 100 - 100/(1 + ag/al)
+def _ts(v):
+    if not v: return 0.0
+    try: return datetime.fromisoformat(v.replace("Z", "+00:00")).timestamp()
+    except (ValueError, TypeError): return 0.0
 
 
-def macd_hist(values):
-    if len(values) < 35:
-        return math.nan
-    # MACD history sufficient for a 9-period signal EMA.
-    line=[]
-    for i in range(26, len(values)+1):
-        xs=values[:i]
-        line.append(ema(xs,12)-ema(xs,26))
-    return line[-1]-ema(line[-9:],9)
+class KalshiPublic:
+    def __init__(self, base=BASE, timeout=15):
+        self.base, self.timeout = base.rstrip('/'), timeout
+
+    def get(self, path, params=None):
+        url = self.base + path
+        if params: url += '?' + urlencode(params)
+        req = Request(url, headers={'Accept':'application/json','User-Agent':'PredictionMarkets-Signal/2.0'})
+        with urlopen(req, timeout=self.timeout) as r:
+            return json.load(r)
+
+    def open_market(self, series):
+        data=self.get('/markets', {'series_ticker':series,'status':'open','limit':100})
+        markets=data.get('markets') or []
+        now=time.time()
+        # Prefer the active contract whose close is nearest in the future.
+        live=[m for m in markets if _ts(m.get('close_time')) > now-5]
+        if not live: return None
+        return min(live, key=lambda m: _ts(m.get('close_time')) or 10**20)
+
+    def market(self, ticker):
+        return self.get('/markets/' + ticker).get('market')
+
+    def orderbook(self, ticker):
+        return self.get('/markets/' + ticker + '/orderbook').get('orderbook_fp') or {}
+
+    def candles(self, series, ticker, start_ts, end_ts):
+        return self.get(f'/series/{series}/markets/{ticker}/candlesticks', {
+            'start_ts':int(start_ts),'end_ts':int(end_ts),'period_interval':1
+        }).get('candlesticks') or []
 
 
-def completed_history(api, symbol, now):
-    end = int(now // TF) * TF
-    start = end - 80 * TF
-    candles = api.candles(symbol, start, end, TF)
-    if len(candles) < 50 or candles[-1].time != end-TF:
-        raise ValueError("completed Coinbase candle history unavailable")
-    return candles
+def _mid(m):
+    bid=_f(m.get('yes_bid_dollars'), math.nan); ask=_f(m.get('yes_ask_dollars'), math.nan)
+    if math.isfinite(bid) and math.isfinite(ask) and ask >= bid: return (bid+ask)/2
+    last=_f(m.get('last_price_dollars'), math.nan)
+    return last if math.isfinite(last) else 0.5
 
 
-def evaluate(api, symbol, now):
-    bucket = int(now // TF) * TF
-    elapsed = now - bucket
-    if not 780 <= elapsed < 900:
-        return None
-    candles = completed_history(api, symbol, now)
-    closes=[c.close for c in candles]
-    vols=[c.volume for c in candles]
-    q=api.liquidity(symbol)
-    price=(q.bid+q.ask)/2
-    open_price=closes[-1]
-    move=(price/open_price-1)*100
-    e9=ema(closes[-40:]+[price],9); e21=ema(closes[-50:]+[price],21)
-    rv=rsi(closes+[price]); mh=macd_hist(closes+[price])
-    avgvol=sum(vols[-20:])/20 if vols[-20:] else 0
-    vr=(vols[-1]/avgvol) if avgvol else 1.0
-
-    up=down=0.0; reasons=[]
-    if price > e9 > e21: up+=2; reasons.append("EMA bullish")
-    elif price < e9 < e21: down+=2; reasons.append("EMA bearish")
-    if move >= 0.08: up+=2; reasons.append("current 15m momentum up")
-    elif move <= -0.08: down+=2; reasons.append("current 15m momentum down")
-    if rv >= 55: up+=1.5; reasons.append("RSI supports up")
-    elif rv <= 45: down+=1.5; reasons.append("RSI supports down")
-    if mh > 0: up+=1.5; reasons.append("MACD positive")
-    elif mh < 0: down+=1.5; reasons.append("MACD negative")
-    # Previous completed candle direction and volume context.
-    prev=closes[-1]/closes[-2]-1
-    if prev > 0: up+=1
-    elif prev < 0: down+=1
-    if vr >= 1.15:
-        if move > 0: up+=1
-        elif move < 0: down+=1
-        reasons.append("volume confirmation")
-
-    total=max(up+down,1)
-    direction="UP" if up>down else "DOWN"
-    edge=abs(up-down)
-    confidence=50 + 50*edge/total
-    # Avoid forced guesses when evidence is mixed or current move is nearly flat.
-    if edge < 2.0 or abs(move) < 0.03:
-        direction="NO TRADE"
-    return dict(symbol=symbol, direction=direction, confidence=min(confidence,95.0), price=price,
-                window_start=bucket, window_end=bucket+TF, seconds_left=max(0,int(bucket+TF-now)),
-                move=move, rsi=rv, ema9=e9, ema21=e21, macd_hist=mh, volume_ratio=vr,
-                reasons=reasons)
+def _book_pressure(book):
+    # Kalshi exposes resting YES and NO bid levels. Sum size as a simple depth-pressure feature.
+    yes=sum(_f(x[1]) for x in (book.get('yes_dollars') or []) if len(x)>=2)
+    no=sum(_f(x[1]) for x in (book.get('no_dollars') or []) if len(x)>=2)
+    total=yes+no
+    return ((yes-no)/total if total else 0.0), yes, no
 
 
-def format_signal(s):
-    coin=s['symbol'].split('-')[0]
-    if s['direction']=='NO TRADE': icon='⚪'
-    else: icon='🟢' if s['direction']=='UP' else '🔴'
-    mins,secs=divmod(s['seconds_left'],60)
+def _market_momentum(candles):
+    vals=[]
+    for c in candles:
+        p=c.get('price') or {}
+        v=_f(p.get('close_dollars'), math.nan)
+        if math.isfinite(v): vals.append(v)
+    if len(vals)<2: return 0.0
+    look=vals[-4:]  # recent ~3 minutes of prediction-price movement
+    return look[-1]-look[0]
+
+
+def evaluate(api, coin, market, now):
+    ticker=market['ticker']; series=SERIES[coin]
+    close_ts=_ts(market.get('close_time'))
+    seconds_left=max(0, int(close_ts-now))
+    yes_mid=_mid(market); no_mid=1.0-yes_mid
+    try: book=api.orderbook(ticker)
+    except Exception as exc:
+        logging.warning('%s orderbook unavailable: %s',ticker,exc); book={}
+    pressure,yes_depth,no_depth=_book_pressure(book)
+    try: candles=api.candles(series,ticker,max(_ts(market.get('open_time')),now-12*60),now)
+    except Exception as exc:
+        logging.warning('%s candlesticks unavailable: %s',ticker,exc); candles=[]
+    momentum=_market_momentum(candles)
+
+    # Kalshi-native ensemble: market probability is primary; recent contract momentum
+    # and order-book depth are confirmations. This is not a guaranteed win probability.
+    edge=(yes_mid-0.5)*2.0
+    score=edge*0.70 + max(-1,min(1,momentum/0.08))*0.20 + pressure*0.10
+    direction='UP' if score>0 else 'DOWN'
+    strength=abs(score)
+    # Do not force a direction when the Kalshi market itself is near 50/50 and confirmations are weak.
+    if strength < 0.08 or (0.47 <= yes_mid <= 0.53 and abs(momentum)<0.02): direction='NO TRADE'
+    confidence=min(95.0, max(50.0, 50.0 + strength*50.0))
+    reasons=[]
+    reasons.append(f"Kalshi YES {yes_mid*100:.1f}% / NO {no_mid*100:.1f}%")
+    if momentum>0.005: reasons.append('Kalshi 1m momentum favors UP')
+    elif momentum<-0.005: reasons.append('Kalshi 1m momentum favors DOWN')
+    if pressure>0.08: reasons.append('orderbook depth favors YES/UP')
+    elif pressure<-0.08: reasons.append('orderbook depth favors NO/DOWN')
+    return {'coin':coin,'series':series,'ticker':ticker,'direction':direction,'confidence':confidence,
+            'yes_mid':yes_mid,'no_mid':no_mid,'momentum':momentum,'pressure':pressure,
+            'yes_depth':yes_depth,'no_depth':no_depth,'close_ts':close_ts,'seconds_left':seconds_left,
+            'volume':_f(market.get('volume_fp') or market.get('volume')),'reasons':reasons}
+
+
+def format_signal(s, stage):
+    icon='🟡' if stage=='EARLY' else '🔵'
+    if s['direction']=='UP': dicon='🟢'
+    elif s['direction']=='DOWN': dicon='🔴'
+    else: dicon='⚪'
+    mins,secs=divmod(max(0,s['seconds_left']),60)
     return '\n'.join([
-        f"{icon} {coin} 15M DIRECTION SIGNAL",
-        '', f"Direction: {s['direction']}", f"Confidence score: {s['confidence']:.1f}/100",
-        f"Coinbase spot: ${s['price']:,.2f}", f"Current-window move: {s['move']:+.3f}%",
-        f"Closes in: {mins}m {secs}s", '',
-        f"RSI: {s['rsi']:.1f}", f"EMA9 / EMA21: {s['ema9']:.2f} / {s['ema21']:.2f}",
-        f"MACD histogram: {s['macd_hist']:.6g}",
-        '', 'Signal only; probability-based research, not guaranteed. No order placed.'
+        f"{icon} {s['coin']} 15M {stage} SIGNAL",'',
+        f"{dicon} Direction: {s['direction']}",f"Confidence: {s['confidence']:.1f}/100",
+        f"Kalshi YES / UP: {s['yes_mid']*100:.1f}%",f"Kalshi NO / DOWN: {s['no_mid']*100:.1f}%",
+        f"Closes in: {mins}m {secs}s",f"Volume: {s['volume']:.0f}",'',
+        f"Market: {s['ticker']}",f"Reason: {'; '.join(s['reasons'])}",'',
+        'Kalshi production public market data. Signal only; no order placed.'
     ])
 
 
@@ -130,112 +146,94 @@ class Runner:
     def __init__(self, api, notifier, dbpath):
         self.api,self.notifier=api,notifier
         Path(dbpath).parent.mkdir(parents=True,exist_ok=True)
-        self.db=sqlite3.connect(dbpath)
-        self.db.row_factory=sqlite3.Row
-        self.db.execute("""CREATE TABLE IF NOT EXISTS sent(
-            asset TEXT, window_start INTEGER, direction TEXT, sent_at REAL,
-            message_id INTEGER, entry_price REAL, window_end INTEGER,
-            result TEXT, close_price REAL, result_at REAL,
-            PRIMARY KEY(asset,window_start))""")
-        cols={r[1] for r in self.db.execute('PRAGMA table_info(sent)')}
-        migrations={'message_id':'INTEGER','entry_price':'REAL','window_end':'INTEGER','result':'TEXT','close_price':'REAL','result_at':'REAL'}
-        for name,typ in migrations.items():
-            if name not in cols:
-                self.db.execute(f'ALTER TABLE sent ADD COLUMN {name} {typ}')
+        self.db=sqlite3.connect(dbpath); self.db.row_factory=sqlite3.Row
+        self.db.execute('''CREATE TABLE IF NOT EXISTS kalshi_signals(
+            ticker TEXT PRIMARY KEY, coin TEXT, close_ts REAL,
+            early_direction TEXT, early_message_id INTEGER, early_at REAL,
+            final_direction TEXT, final_message_id INTEGER, final_at REAL,
+            result TEXT, official_outcome TEXT, result_at REAL)''')
         self.db.commit()
 
-    def already(self, asset, window):
-        return self.db.execute('SELECT 1 FROM sent WHERE asset=? AND window_start=?',(asset,window)).fetchone() is not None
+    def row(self,ticker): return self.db.execute('SELECT * FROM kalshi_signals WHERE ticker=?',(ticker,)).fetchone()
+    def ensure(self,s):
+        with self.db:
+            self.db.execute('INSERT OR IGNORE INTO kalshi_signals(ticker,coin,close_ts) VALUES(?,?,?)',(s['ticker'],s['coin'],s['close_ts']))
 
-    def reserve_and_send(self,s):
-        try:
-            with self.db:
-                self.db.execute("""INSERT INTO sent(asset,window_start,direction,sent_at,entry_price,window_end)
-                                   VALUES(?,?,?,?,?,?)""",
-                                (s['symbol'],s['window_start'],s['direction'],time.time(),s['price'],s['window_end']))
-        except sqlite3.IntegrityError:
-            return False
-        try:
-            message_id=self.notifier.send_text(format_signal(s))
-            with self.db:
-                self.db.execute('UPDATE sent SET message_id=? WHERE asset=? AND window_start=?',(message_id,s['symbol'],s['window_start']))
-            return True
-        except Exception:
-            logging.exception('%s Telegram signal delivery failed/ambiguous',s['symbol'])
-            return False
+    def send_stage(self,s,stage):
+        self.ensure(s); row=self.row(s['ticker'])
+        col='early_message_id' if stage=='EARLY' else 'final_message_id'
+        if row[col] is not None: return False
+        reply=row['early_message_id'] if stage=='FINAL' else None
+        mid=self.notifier.send_text(format_signal(s,stage),reply_to_message_id=reply)
+        with self.db:
+            if stage=='EARLY': self.db.execute('UPDATE kalshi_signals SET early_direction=?,early_message_id=?,early_at=? WHERE ticker=?',(s['direction'],mid,time.time(),s['ticker']))
+            else: self.db.execute('UPDATE kalshi_signals SET final_direction=?,final_message_id=?,final_at=? WHERE ticker=?',(s['direction'],mid,time.time(),s['ticker']))
+        return True
 
     def stats(self):
-        row=self.db.execute("""SELECT
-            SUM(CASE WHEN direction IN ('UP','DOWN') THEN 1 ELSE 0 END) total,
-            SUM(CASE WHEN result IN ('WIN','LOSS','DRAW') THEN 1 ELSE 0 END) closed,
-            SUM(CASE WHEN result='WIN' THEN 1 ELSE 0 END) wins,
-            SUM(CASE WHEN result='LOSS' THEN 1 ELSE 0 END) losses,
-            SUM(CASE WHEN result='DRAW' THEN 1 ELSE 0 END) draws FROM sent""").fetchone()
-        out={k:int(row[k] or 0) for k in ('total','closed','wins','losses','draws')}
-        decisive=out['wins']+out['losses']
-        out['win_rate']=(100.0*out['wins']/decisive) if decisive else 0.0
-        return out
+        r=self.db.execute('''SELECT COUNT(*) total,
+          SUM(CASE WHEN result IN ('WIN','LOSS') THEN 1 ELSE 0 END) closed,
+          SUM(CASE WHEN result='WIN' THEN 1 ELSE 0 END) wins,
+          SUM(CASE WHEN result='LOSS' THEN 1 ELSE 0 END) losses
+          FROM kalshi_signals WHERE final_direction IN ('UP','DOWN')''').fetchone()
+        d={k:int(r[k] or 0) for k in ('total','closed','wins','losses')}; d['rate']=100*d['wins']/d['closed'] if d['closed'] else 0.0; return d
 
-    def candle_close(self, symbol, window_start, window_end):
-        candles=self.api.candles(symbol,window_start,window_end,TF)
-        match=[c for c in candles if c.time==window_start]
-        if not match:
-            raise ValueError('completed signal candle not published yet')
-        return match[-1].close
-
-    def settle_due(self, now):
-        rows=self.db.execute("""SELECT * FROM sent
-            WHERE direction IN ('UP','DOWN') AND result IS NULL
-              AND message_id IS NOT NULL AND window_end IS NOT NULL AND window_end<=?
-            ORDER BY window_end,asset""",(now,)).fetchall()
+    def settle_due(self,now):
+        rows=self.db.execute('''SELECT * FROM kalshi_signals WHERE result IS NULL AND close_ts<=?
+          AND final_direction IN ('UP','DOWN') AND final_message_id IS NOT NULL ORDER BY close_ts''',(now,)).fetchall()
         for row in rows:
             try:
-                close=self.candle_close(row['asset'],row['window_start'],row['window_end'])
-                entry=float(row['entry_price']); delta=close-entry
-                tol=max(abs(entry)*1e-10,1e-10)
-                if abs(delta)<=tol: result='DRAW'
-                elif row['direction']=='UP': result='WIN' if delta>0 else 'LOSS'
-                else: result='WIN' if delta<0 else 'LOSS'
+                m=self.api.market(row['ticker'])
+                outcome=(m.get('result') or '').lower()
+                status=(m.get('status') or '').lower()
+                if outcome not in ('yes','no'):
+                    logging.info('%s awaiting Kalshi settlement (status=%s)',row['ticker'],status); continue
+                predicted='yes' if row['final_direction']=='UP' else 'no'
+                result='WIN' if predicted==outcome else 'LOSS'
                 with self.db:
-                    self.db.execute('UPDATE sent SET result=?,close_price=?,result_at=? WHERE asset=? AND window_start=? AND result IS NULL',(result,close,time.time(),row['asset'],row['window_start']))
-                st=self.stats(); coin=row['asset'].split('-')[0]; move=(close/entry-1)*100
-                icon={'WIN':'✅','LOSS':'❌','DRAW':'➖'}[result]
-                text='\n'.join([f"{icon} {coin} 15M RESULT: {result}",'',f"Signal: {row['direction']}",f"Signal price: ${entry:,.2f}",f"15M candle close: ${close:,.2f}",f"Move from signal: {move:+.3f}%",'',f"📊 Total directional signals: {st['total']}",f"📋 Closed: {st['closed']} | Pending: {max(0,st['total']-st['closed'])}",f"🏆 Wins: {st['wins']} | ❌ Losses: {st['losses']} | ➖ Draws: {st['draws']}",f"📈 Win rate: {st['win_rate']:.1f}%",'','Result is based on Coinbase 15M candle close versus the signal-time spot price.','Signal tracking only; no order placed.'])
-                self.notifier.send_text(text,reply_to_message_id=row['message_id'])
-                logging.info('%s result replied: %s | entry=%.2f close=%.2f',row['asset'],result,entry,close)
-            except Exception as exc:
-                logging.warning('%s result settlement pending: %s',row['asset'],exc)
+                    self.db.execute('UPDATE kalshi_signals SET result=?,official_outcome=?,result_at=? WHERE ticker=?',(result,outcome,time.time(),row['ticker']))
+                st=self.stats(); icon='✅' if result=='WIN' else '❌'; official='UP / YES' if outcome=='yes' else 'DOWN / NO'
+                txt='\n'.join([f"{icon} {row['coin']} 15M RESULT: {result}",'',f"Final Signal: {row['final_direction']}",f"Kalshi official result: {official}",f"Market: {row['ticker']}",'',f"📊 Closed: {st['closed']} | Wins: {st['wins']} | Losses: {st['losses']}",f"📈 Final-signal win rate: {st['rate']:.1f}%",'', 'Result uses Kalshi official settlement, not a separate spot-price comparison.'])
+                self.notifier.send_text(txt,reply_to_message_id=row['final_message_id'])
+                logging.info('%s settled %s official=%s',row['ticker'],result,outcome)
+            except Exception as exc: logging.warning('%s settlement pending/error: %s',row['ticker'],exc)
 
     def cycle(self):
         now=time.time(); self.settle_due(now)
-        bucket=int(now//TF)*TF; elapsed=now-bucket
-        if elapsed < 780:
-            logging.info('MONITORING BTC/ETH | 15m window | decision in %dm %ds', int((780-elapsed)//60), int((780-elapsed)%60)); return
-        for symbol in ASSETS:
-            if self.already(symbol,bucket): continue
+        for coin,series in SERIES.items():
             try:
-                s=evaluate(self.api,symbol,time.time())
-                if s and self.reserve_and_send(s): logging.info('%s signal sent: %s %.1f',symbol,s['direction'],s['confidence'])
-            except Exception as exc:
-                logging.error('%s evaluation failed: %s',symbol,exc)
+                m=self.api.open_market(series)
+                if not m: logging.info('%s no open Kalshi 15m market',coin); continue
+                s=evaluate(self.api,coin,m,now); left=s['seconds_left']
+                # Poll-safe windows: one message around T-3m, then one around T-1m.
+                if 150 <= left <= 210:
+                    if self.send_stage(s,'EARLY'): logging.info('%s EARLY sent %s',coin,s['direction'])
+                elif 35 <= left <= 90:
+                    # Ensure the 1m final can still be sent if bot started after T-3m.
+                    self.ensure(s)
+                    if self.send_stage(s,'FINAL'): logging.info('%s FINAL sent %s',coin,s['direction'])
+                else: logging.info('%s monitoring Kalshi | %ss to close | YES %.1f%%',coin,left,s['yes_mid']*100)
+            except Exception as exc: logging.exception('%s Kalshi evaluation failed: %s',coin,exc)
 
-def main():
-    p=argparse.ArgumentParser(description='BTC/ETH Coinbase 15m direction signal monitor; Telegram only')
-    p.add_argument('--env',default='.env'); p.add_argument('--interval',type=int,default=20)
-    args=p.parse_args()
-    logging.basicConfig(level=logging.INFO,format='%(asctime)s %(levelname)s %(message)s')
+
+def load_env(path):
     env={}
-    if Path(args.env).exists():
-        for raw in Path(args.env).read_text(encoding='utf-8').splitlines():
+    if Path(path).exists():
+        for raw in Path(path).read_text(encoding='utf-8').splitlines():
             raw=raw.strip()
             if raw and not raw.startswith('#') and '=' in raw:
                 k,v=raw.split('=',1); env[k.strip()]=v.strip().strip('"').strip("'")
-    token=os.environ.get('TELEGRAM_TOKEN') or env.get('TELEGRAM_TOKEN')
-    chat=os.environ.get('TELEGRAM_CHAT_ID') or env.get('TELEGRAM_CHAT_ID')
-    notifier=Telegram(token,chat)
-    runner=Runner(Coinbase(),notifier,'data/btc_eth_15m.sqlite')
-    notifier.send_text('🟢 BTC/ETH 15M SIGNAL BOT RUNNING\n\nMonitoring Coinbase BTC-USD and ETH-USD.\nDecision window: final 2 minutes of each 15-minute interval.\nSignal only; no order placed.')
-    logging.info('BTC/ETH 15M BOT STARTED | interval=%ss | final-2m decision window',args.interval)
+    return env
+
+
+def main():
+    p=argparse.ArgumentParser(description='Kalshi BTC/ETH 15m public-market signal monitor; Telegram only')
+    p.add_argument('--env',default='.env'); p.add_argument('--interval',type=int,default=20); args=p.parse_args()
+    logging.basicConfig(level=logging.INFO,format='%(asctime)s %(levelname)s %(message)s')
+    env=load_env(args.env); token=os.environ.get('TELEGRAM_TOKEN') or env.get('TELEGRAM_TOKEN'); chat=os.environ.get('TELEGRAM_CHAT_ID') or env.get('TELEGRAM_CHAT_ID')
+    notifier=Telegram(token,chat); runner=Runner(KalshiPublic(),notifier,'data/kalshi_btc_eth_15m.sqlite')
+    notifier.send_text('🟢 KALSHI BTC/ETH 15M SIGNAL BOT RUNNING\n\nPrimary source: Kalshi production public market data.\nSignals: ~3m early + ~1m final reply.\nResults: official Kalshi settlement.\nSignal only; no order placed.')
+    logging.info('KALSHI BTC/ETH 15M BOT STARTED | interval=%ss',args.interval)
     while True:
         try: runner.cycle()
         except Exception as exc: logging.exception('cycle failed: %s',exc)
