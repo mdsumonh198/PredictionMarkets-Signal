@@ -131,34 +131,93 @@ class Runner:
         self.api,self.notifier=api,notifier
         Path(dbpath).parent.mkdir(parents=True,exist_ok=True)
         self.db=sqlite3.connect(dbpath)
-        self.db.execute('CREATE TABLE IF NOT EXISTS sent(asset TEXT, window_start INTEGER, direction TEXT, sent_at REAL, PRIMARY KEY(asset,window_start))')
+        self.db.row_factory=sqlite3.Row
+        self.db.execute("""CREATE TABLE IF NOT EXISTS sent(
+            asset TEXT, window_start INTEGER, direction TEXT, sent_at REAL,
+            message_id INTEGER, entry_price REAL, window_end INTEGER,
+            result TEXT, close_price REAL, result_at REAL,
+            PRIMARY KEY(asset,window_start))""")
+        cols={r[1] for r in self.db.execute('PRAGMA table_info(sent)')}
+        migrations={'message_id':'INTEGER','entry_price':'REAL','window_end':'INTEGER','result':'TEXT','close_price':'REAL','result_at':'REAL'}
+        for name,typ in migrations.items():
+            if name not in cols:
+                self.db.execute(f'ALTER TABLE sent ADD COLUMN {name} {typ}')
+        self.db.commit()
 
     def already(self, asset, window):
         return self.db.execute('SELECT 1 FROM sent WHERE asset=? AND window_start=?',(asset,window)).fetchone() is not None
 
-    def reserve(self,s):
+    def reserve_and_send(self,s):
         try:
             with self.db:
-                self.db.execute('INSERT INTO sent VALUES(?,?,?,?)',(s['symbol'],s['window_start'],s['direction'],time.time()))
-            return True
+                self.db.execute("""INSERT INTO sent(asset,window_start,direction,sent_at,entry_price,window_end)
+                                   VALUES(?,?,?,?,?,?)""",
+                                (s['symbol'],s['window_start'],s['direction'],time.time(),s['price'],s['window_end']))
         except sqlite3.IntegrityError:
             return False
+        try:
+            message_id=self.notifier.send_text(format_signal(s))
+            with self.db:
+                self.db.execute('UPDATE sent SET message_id=? WHERE asset=? AND window_start=?',(message_id,s['symbol'],s['window_start']))
+            return True
+        except Exception:
+            logging.exception('%s Telegram signal delivery failed/ambiguous',s['symbol'])
+            return False
+
+    def stats(self):
+        row=self.db.execute("""SELECT
+            SUM(CASE WHEN direction IN ('UP','DOWN') THEN 1 ELSE 0 END) total,
+            SUM(CASE WHEN result IN ('WIN','LOSS','DRAW') THEN 1 ELSE 0 END) closed,
+            SUM(CASE WHEN result='WIN' THEN 1 ELSE 0 END) wins,
+            SUM(CASE WHEN result='LOSS' THEN 1 ELSE 0 END) losses,
+            SUM(CASE WHEN result='DRAW' THEN 1 ELSE 0 END) draws FROM sent""").fetchone()
+        out={k:int(row[k] or 0) for k in ('total','closed','wins','losses','draws')}
+        decisive=out['wins']+out['losses']
+        out['win_rate']=(100.0*out['wins']/decisive) if decisive else 0.0
+        return out
+
+    def candle_close(self, symbol, window_start, window_end):
+        candles=self.api.candles(symbol,window_start,window_end,TF)
+        match=[c for c in candles if c.time==window_start]
+        if not match:
+            raise ValueError('completed signal candle not published yet')
+        return match[-1].close
+
+    def settle_due(self, now):
+        rows=self.db.execute("""SELECT * FROM sent
+            WHERE direction IN ('UP','DOWN') AND result IS NULL
+              AND message_id IS NOT NULL AND window_end IS NOT NULL AND window_end<=?
+            ORDER BY window_end,asset""",(now,)).fetchall()
+        for row in rows:
+            try:
+                close=self.candle_close(row['asset'],row['window_start'],row['window_end'])
+                entry=float(row['entry_price']); delta=close-entry
+                tol=max(abs(entry)*1e-10,1e-10)
+                if abs(delta)<=tol: result='DRAW'
+                elif row['direction']=='UP': result='WIN' if delta>0 else 'LOSS'
+                else: result='WIN' if delta<0 else 'LOSS'
+                with self.db:
+                    self.db.execute('UPDATE sent SET result=?,close_price=?,result_at=? WHERE asset=? AND window_start=? AND result IS NULL',(result,close,time.time(),row['asset'],row['window_start']))
+                st=self.stats(); coin=row['asset'].split('-')[0]; move=(close/entry-1)*100
+                icon={'WIN':'✅','LOSS':'❌','DRAW':'➖'}[result]
+                text='\n'.join([f"{icon} {coin} 15M RESULT: {result}",'',f"Signal: {row['direction']}",f"Signal price: ${entry:,.2f}",f"15M candle close: ${close:,.2f}",f"Move from signal: {move:+.3f}%",'',f"📊 Total directional signals: {st['total']}",f"📋 Closed: {st['closed']} | Pending: {max(0,st['total']-st['closed'])}",f"🏆 Wins: {st['wins']} | ❌ Losses: {st['losses']} | ➖ Draws: {st['draws']}",f"📈 Win rate: {st['win_rate']:.1f}%",'','Result is based on Coinbase 15M candle close versus the signal-time spot price.','Signal tracking only; no order placed.'])
+                self.notifier.send_text(text,reply_to_message_id=row['message_id'])
+                logging.info('%s result replied: %s | entry=%.2f close=%.2f',row['asset'],result,entry,close)
+            except Exception as exc:
+                logging.warning('%s result settlement pending: %s',row['asset'],exc)
 
     def cycle(self):
-        now=time.time(); bucket=int(now//TF)*TF; elapsed=now-bucket
+        now=time.time(); self.settle_due(now)
+        bucket=int(now//TF)*TF; elapsed=now-bucket
         if elapsed < 780:
-            logging.info('MONITORING BTC/ETH | 15m window | decision in %dm %ds', int((780-elapsed)//60), int((780-elapsed)%60))
-            return
+            logging.info('MONITORING BTC/ETH | 15m window | decision in %dm %ds', int((780-elapsed)//60), int((780-elapsed)%60)); return
         for symbol in ASSETS:
             if self.already(symbol,bucket): continue
             try:
                 s=evaluate(self.api,symbol,time.time())
-                if s and self.reserve(s):
-                    self.notifier.send_text(format_signal(s))
-                    logging.info('%s signal sent: %s %.1f',symbol,s['direction'],s['confidence'])
+                if s and self.reserve_and_send(s): logging.info('%s signal sent: %s %.1f',symbol,s['direction'],s['confidence'])
             except Exception as exc:
                 logging.error('%s evaluation failed: %s',symbol,exc)
-
 
 def main():
     p=argparse.ArgumentParser(description='BTC/ETH Coinbase 15m direction signal monitor; Telegram only')
