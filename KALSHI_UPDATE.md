@@ -11,3 +11,11 @@
 - No order placement code is used.
 
 Accuracy is measured from settled FINAL signals. No fixed win rate is guaranteed.
+
+## Price display patch
+- Telegram EARLY and FINAL messages now show Target Price first (`floor_strike`).
+- Then show Current BTC/ETH Price from a free public spot ticker.
+- Then show only Above/Below Target percentage (no dollar difference).
+- Kalshi YES/NO, orderbook and contract momentum remain the signal inputs.
+- WIN/LOSS continues to use Kalshi official settlement.
+- Current spot display failure does not stop Kalshi signal generation.

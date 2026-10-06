@@ -19,7 +19,9 @@ from urllib.request import Request, urlopen
 from scanner.notifications.telegram import Telegram
 
 BASE = "https://external-api.kalshi.com/trade-api/v2"
+KRAKEN_BASE = "https://api.kraken.com/0/public/Ticker"
 SERIES = {"BTC": "KXBTC15M", "ETH": "KXETH15M"}
+KRAKEN_PAIRS = {"BTC": "XBTUSD", "ETH": "ETHUSD"}
 
 
 def _f(v, default=0.0):
@@ -65,6 +67,26 @@ class KalshiPublic:
         }).get('candlesticks') or []
 
 
+
+def current_spot(coin, timeout=10):
+    """Free public display price. Settlement still uses Kalshi official result."""
+    pair = KRAKEN_PAIRS[coin]
+    req = Request(KRAKEN_BASE + '?' + urlencode({'pair': pair}),
+                  headers={'Accept':'application/json','User-Agent':'PredictionMarkets-Signal/2.1'})
+    with urlopen(req, timeout=timeout) as r:
+        data = json.load(r)
+    if data.get('error'):
+        raise ValueError('Kraken ticker error: ' + ', '.join(data['error']))
+    rows = data.get('result') or {}
+    if not rows:
+        raise ValueError('Kraken ticker returned no result')
+    row = next(iter(rows.values()))
+    price = _f((row.get('c') or [None])[0], math.nan)
+    if not math.isfinite(price) or price <= 0:
+        raise ValueError('Kraken ticker returned invalid price')
+    return price
+
+
 def _mid(m):
     bid=_f(m.get('yes_bid_dollars'), math.nan); ask=_f(m.get('yes_ask_dollars'), math.nan)
     if math.isfinite(bid) and math.isfinite(ask) and ask >= bid: return (bid+ask)/2
@@ -96,6 +118,14 @@ def evaluate(api, coin, market, now):
     close_ts=_ts(market.get('close_time'))
     seconds_left=max(0, int(close_ts-now))
     yes_mid=_mid(market); no_mid=1.0-yes_mid
+    target=_f(market.get('floor_strike'), math.nan)
+    if not math.isfinite(target) or target <= 0:
+        target=None
+    try:
+        spot=current_spot(coin)
+    except Exception as exc:
+        logging.warning('%s current spot unavailable: %s',coin,exc); spot=None
+    distance_pct=((spot-target)/target*100.0) if (spot is not None and target is not None) else None
     try: book=api.orderbook(ticker)
     except Exception as exc:
         logging.warning('%s orderbook unavailable: %s',ticker,exc); book={}
@@ -123,7 +153,8 @@ def evaluate(api, coin, market, now):
     return {'coin':coin,'series':series,'ticker':ticker,'direction':direction,'confidence':confidence,
             'yes_mid':yes_mid,'no_mid':no_mid,'momentum':momentum,'pressure':pressure,
             'yes_depth':yes_depth,'no_depth':no_depth,'close_ts':close_ts,'seconds_left':seconds_left,
-            'volume':_f(market.get('volume_fp') or market.get('volume')),'reasons':reasons}
+            'volume':_f(market.get('volume_fp') or market.get('volume')),'reasons':reasons,
+            'target':target,'spot':spot,'distance_pct':distance_pct}
 
 
 def format_signal(s, stage):
@@ -132,13 +163,22 @@ def format_signal(s, stage):
     elif s['direction']=='DOWN': dicon='🔴'
     else: dicon='⚪'
     mins,secs=divmod(max(0,s['seconds_left']),60)
+    price_lines=[]
+    if s.get('target') is not None:
+        price_lines.append(f"Target Price: ${s['target']:,.2f}")
+    if s.get('spot') is not None:
+        price_lines.append(f"Current {s['coin']} Price: ${s['spot']:,.2f}")
+    if s.get('distance_pct') is not None:
+        label='Above Target' if s['distance_pct'] >= 0 else 'Below Target'
+        price_lines.append(f"{label}: {s['distance_pct']:+.3f}%")
     return '\n'.join([
         f"{icon} {s['coin']} 15M {stage} SIGNAL",'',
-        f"{dicon} Direction: {s['direction']}",f"Confidence: {s['confidence']:.1f}/100",
+        f"{dicon} Direction: {s['direction']}",f"Confidence: {s['confidence']:.1f}/100",'',
+        *price_lines,'',
         f"Kalshi YES / UP: {s['yes_mid']*100:.1f}%",f"Kalshi NO / DOWN: {s['no_mid']*100:.1f}%",
         f"Closes in: {mins}m {secs}s",f"Volume: {s['volume']:.0f}",'',
         f"Market: {s['ticker']}",f"Reason: {'; '.join(s['reasons'])}",'',
-        'Kalshi production public market data. Signal only; no order placed.'
+        'Signal source: Kalshi production public market data. Current crypto price: public spot ticker. Result: Kalshi official settlement.'
     ])
 
 
