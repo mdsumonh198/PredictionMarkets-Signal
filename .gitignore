@@ -1,0 +1,12 @@
+.env
+.venv/
+__pycache__/
+*.pyc
+data/
+*.sqlite*
+reports/
+*.log
+*.pem
+*.key
+prediction.env
+prediction-config.json

@@ -1,0 +1,12 @@
+[Unit]
+Description=Prediction Market Bot Dashboard
+After=network-online.target
+[Service]
+Type=simple
+WorkingDirectory=/root/PredictionMarkets-Signal
+EnvironmentFile=/root/PredictionMarkets-Signal/.env
+ExecStart=/root/PredictionMarkets-Signal/.venv/bin/python -u -m scanner.dashboard --host 0.0.0.0 --port 8787
+Restart=always
+RestartSec=5
+[Install]
+WantedBy=multi-user.target
