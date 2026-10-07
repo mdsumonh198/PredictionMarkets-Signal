@@ -17,6 +17,7 @@ from urllib.parse import urlencode
 from urllib.request import Request, urlopen
 
 from scanner.notifications.telegram import Telegram
+from scanner.control import Control
 
 BASE = "https://external-api.kalshi.com/trade-api/v2"
 KRAKEN_BASE = "https://api.kraken.com/0/public/Ticker"
@@ -159,32 +160,28 @@ def evaluate(api, coin, market, now):
 
 def format_signal(s, stage):
     icon='🟡' if stage=='EARLY' else '🔵'
-    if s['direction']=='UP': dicon='🟢'
-    elif s['direction']=='DOWN': dicon='🔴'
-    else: dicon='⚪'
+    d=s['direction']; dicon='🟢' if d=='UP' else ('🔴' if d=='DOWN' else '⚪')
     mins,secs=divmod(max(0,s['seconds_left']),60)
-    price_lines=[]
-    if s.get('target') is not None:
-        price_lines.append(f"Target Price: ${s['target']:,.2f}")
-    if s.get('spot') is not None:
-        price_lines.append(f"Current {s['coin']} Price: ${s['spot']:,.2f}")
+    price=[]
+    if s.get('target') is not None: price.append(f"Target Price: ${s['target']:,.2f}")
+    if s.get('spot') is not None: price.append(f"Current {s['coin']} Price: ${s['spot']:,.2f}")
     if s.get('distance_pct') is not None:
-        label='Above Target' if s['distance_pct'] >= 0 else 'Below Target'
-        price_lines.append(f"{label}: {s['distance_pct']:+.3f}%")
-    return '\n'.join([
-        f"{icon} {s['coin']} 15M {stage} SIGNAL",'',
-        f"{dicon} Direction: {s['direction']}",f"Confidence: {s['confidence']:.1f}/100",'',
-        *price_lines,'',
-        f"Kalshi YES / UP: {s['yes_mid']*100:.1f}%",f"Kalshi NO / DOWN: {s['no_mid']*100:.1f}%",
-        f"Closes in: {mins}m {secs}s",f"Volume: {s['volume']:.0f}",'',
-        f"Market: {s['ticker']}",f"Reason: {'; '.join(s['reasons'])}",'',
-        'Signal source: Kalshi production public market data. Current crypto price: public spot ticker. Result: Kalshi official settlement.'
-    ])
+        label='Above Target' if s['distance_pct'] >= 0 else 'Below Target'; price.append(f"{label}: {s['distance_pct']:+.3f}%")
+    why=[]
+    if s.get('distance_pct') is not None: why.append('Current price is above the target' if s['distance_pct']>=0 else 'Current price is below the target')
+    if s.get('momentum',0)>0.005: why.append('Short-term market momentum is UP')
+    elif s.get('momentum',0)<-0.005: why.append('Short-term market momentum is DOWN')
+    if s.get('pressure',0)>0.08: why.append('Prediction-market activity supports UP')
+    elif s.get('pressure',0)<-0.08: why.append('Prediction-market activity supports DOWN')
+    if not why: why=['Market signals are mixed']
+    tail='⚠️ Early signal — wait for the Final Signal.' if stage=='EARLY' else ('✅ Final signal for this 15-minute market.' if d!='NO TRADE' else '⚪ Direction is unclear — skip this market.')
+    return '\n'.join([f"{icon} {s['coin']} 15M {stage} SIGNAL",'',f"{dicon} Signal: {d}",f"Confidence: {s['confidence']:.1f}%",'',*price,'','Market Chance:',f"UP: {s['yes_mid']*100:.1f}%",f"DOWN: {s['no_mid']*100:.1f}%",f"Time Left: {mins}m {secs}s",'',f"Why {d}?" if d!='NO TRADE' else 'Why NO TRADE?',*[f"• {x}" for x in why],'',tail])
 
 
 class Runner:
     def __init__(self, api, notifier, dbpath):
         self.api,self.notifier=api,notifier
+        self.control=Control(dbpath)
         Path(dbpath).parent.mkdir(parents=True,exist_ok=True)
         self.db=sqlite3.connect(dbpath); self.db.row_factory=sqlite3.Row
         self.db.execute('''CREATE TABLE IF NOT EXISTS kalshi_signals(
@@ -238,6 +235,18 @@ class Runner:
                 logging.info('%s settled %s official=%s',row['ticker'],result,outcome)
             except Exception as exc: logging.warning('%s settlement pending/error: %s',row['ticker'],exc)
 
+    def execute_mode(self,s,stage):
+        cfg=self.control.get()
+        if not cfg.get('enabled') or cfg.get('mode')=='signal' or s['direction']=='NO TRADE': return
+        if not cfg.get(s['coin'].lower(),True): return
+        amount=float(cfg.get('amount_usd',10.0))
+        if cfg.get('mode')=='paper':
+            action='ENTER' if stage=='EARLY' else 'KEEP/CLOSE CHECK'
+            self.control.log(ticker=s['ticker'],coin=s['coin'],stage=stage,action=action,direction=s['direction'],amount=amount,status='PAPER',note='No real order placed')
+            return
+        # Hard safety lock: do not guess a Coinbase Prediction Markets order endpoint.
+        self.control.log(ticker=s['ticker'],coin=s['coin'],stage=stage,action='BLOCKED',direction=s['direction'],amount=amount,status='LIVE_LOCKED',note='Coinbase Prediction Market programmatic order endpoint not verified')
+
     def cycle(self):
         now=time.time(); self.settle_due(now)
         for coin,series in SERIES.items():
@@ -247,11 +256,13 @@ class Runner:
                 s=evaluate(self.api,coin,m,now); left=s['seconds_left']
                 # Poll-safe windows: one message around T-3m, then one around T-1m.
                 if 150 <= left <= 210:
-                    if self.send_stage(s,'EARLY'): logging.info('%s EARLY sent %s',coin,s['direction'])
+                    if self.send_stage(s,'EARLY'):
+                        self.execute_mode(s,'EARLY'); logging.info('%s EARLY sent %s',coin,s['direction'])
                 elif 35 <= left <= 90:
                     # Ensure the 1m final can still be sent if bot started after T-3m.
                     self.ensure(s)
-                    if self.send_stage(s,'FINAL'): logging.info('%s FINAL sent %s',coin,s['direction'])
+                    if self.send_stage(s,'FINAL'):
+                        self.execute_mode(s,'FINAL'); logging.info('%s FINAL sent %s',coin,s['direction'])
                 else: logging.info('%s monitoring Kalshi | %ss to close | YES %.1f%%',coin,left,s['yes_mid']*100)
             except Exception as exc: logging.exception('%s Kalshi evaluation failed: %s',coin,exc)
 
@@ -272,7 +283,7 @@ def main():
     logging.basicConfig(level=logging.INFO,format='%(asctime)s %(levelname)s %(message)s')
     env=load_env(args.env); token=os.environ.get('TELEGRAM_TOKEN') or env.get('TELEGRAM_TOKEN'); chat=os.environ.get('TELEGRAM_CHAT_ID') or env.get('TELEGRAM_CHAT_ID')
     notifier=Telegram(token,chat); runner=Runner(KalshiPublic(),notifier,'data/kalshi_btc_eth_15m.sqlite')
-    notifier.send_text('🟢 KALSHI BTC/ETH 15M SIGNAL BOT RUNNING\n\nPrimary source: Kalshi production public market data.\nSignals: ~3m early + ~1m final reply.\nResults: official Kalshi settlement.\nSignal only; no order placed.')
+    notifier.send_text('🟢 KALSHI BTC/ETH 15M SIGNAL BOT RUNNING\n\nPrimary source: Kalshi production public market data.\nSignals: ~3m early + ~1m final reply.\nResults: official Kalshi settlement.\nControl modes: Signal Only / Paper Auto Trade / Live Auto Trade (live remains safety-locked until verified API support).')
     logging.info('KALSHI BTC/ETH 15M BOT STARTED | interval=%ss',args.interval)
     while True:
         try: runner.cycle()
