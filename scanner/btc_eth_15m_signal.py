@@ -18,6 +18,7 @@ from urllib.request import Request, urlopen
 
 from scanner.notifications.telegram import Telegram
 from scanner.control import Control
+from scanner.kalshi_live import KalshiLive, KalshiTradeError
 
 BASE = "https://external-api.kalshi.com/trade-api/v2"
 KRAKEN_BASE = "https://api.kraken.com/0/public/Ticker"
@@ -237,15 +238,35 @@ class Runner:
 
     def execute_mode(self,s,stage):
         cfg=self.control.get()
-        if not cfg.get('enabled') or cfg.get('mode')=='signal' or s['direction']=='NO TRADE': return
+        if not cfg.get('enabled') or cfg.get('mode')=='signal': return
         if not cfg.get(s['coin'].lower(),True): return
-        amount=float(cfg.get('amount_usd',10.0))
+        amount=float(cfg.get('amount_usd',10.0)); direction=s['direction']
         if cfg.get('mode')=='paper':
-            action='ENTER' if stage=='EARLY' else 'KEEP/CLOSE CHECK'
-            self.control.log(ticker=s['ticker'],coin=s['coin'],stage=stage,action=action,direction=s['direction'],amount=amount,status='PAPER',note='No real order placed')
+            action='ENTER' if stage=='EARLY' and direction!='NO TRADE' else ('FINAL CHECK' if stage=='FINAL' else 'SKIP')
+            self.control.log(ticker=s['ticker'],coin=s['coin'],stage=stage,action=action,direction=direction,amount=amount,status='PAPER',note='No real order placed')
             return
-        # Hard safety lock: do not guess a Coinbase Prediction Markets order endpoint.
-        self.control.log(ticker=s['ticker'],coin=s['coin'],stage=stage,action='BLOCKED',direction=s['direction'],amount=amount,status='LIVE_LOCKED',note='Coinbase Prediction Market programmatic order endpoint not verified')
+        try:
+            if self.live is None: self.live=KalshiLive(self.env)
+            pos=self.control.position(s['ticker'])
+            if stage=='EARLY':
+                if direction=='NO TRADE' or (pos and pos['status']=='OPEN'): return
+                data,count,price=self.live.enter(s['ticker'],direction,amount)
+                order=data.get('order') or data
+                oid=order.get('order_id',''); filled=float(order.get('fill_count') or order.get('fill_count_fp') or count)
+                if filled<=0: raise KalshiTradeError('Entry IOC order was not filled')
+                self.control.save_position(ticker=s['ticker'],coin=s['coin'],direction=direction,count=filled,entry_price=price,order_id=oid,status='OPEN')
+                self.control.log(ticker=s['ticker'],coin=s['coin'],stage=stage,action='ENTER',direction=direction,amount=amount,status='LIVE',price=price,note='Kalshi order '+oid)
+            elif stage=='FINAL' and pos and pos['status']=='OPEN':
+                if direction==pos['direction']:
+                    self.control.log(ticker=s['ticker'],coin=s['coin'],stage=stage,action='HOLD',direction=direction,amount=amount,status='LIVE',price=pos['entry_price'],note='Final signal confirmed; hold for settlement')
+                else:
+                    data,count,price=self.live.close(s['ticker'],pos['direction'],pos['count'])
+                    order=data.get('order') or data; oid=order.get('order_id','')
+                    self.control.close_position(s['ticker'],'CLOSED')
+                    self.control.log(ticker=s['ticker'],coin=s['coin'],stage=stage,action='CLOSE',direction=pos['direction'],amount=amount,status='LIVE',price=price,note='Final changed to '+direction+'; close order '+oid)
+        except Exception as exc:
+            logging.exception('%s live execution failed',s['ticker'])
+            self.control.log(ticker=s['ticker'],coin=s['coin'],stage=stage,action='ERROR',direction=direction,amount=amount,status='LIVE_ERROR',note=str(exc)[:500])
 
     def cycle(self):
         now=time.time(); self.settle_due(now)
@@ -282,8 +303,8 @@ def main():
     p.add_argument('--env',default='.env'); p.add_argument('--interval',type=int,default=20); args=p.parse_args()
     logging.basicConfig(level=logging.INFO,format='%(asctime)s %(levelname)s %(message)s')
     env=load_env(args.env); token=os.environ.get('TELEGRAM_TOKEN') or env.get('TELEGRAM_TOKEN'); chat=os.environ.get('TELEGRAM_CHAT_ID') or env.get('TELEGRAM_CHAT_ID')
-    notifier=Telegram(token,chat); runner=Runner(KalshiPublic(),notifier,'data/kalshi_btc_eth_15m.sqlite')
-    notifier.send_text('🟢 KALSHI BTC/ETH 15M SIGNAL BOT RUNNING\n\nPrimary source: Kalshi production public market data.\nSignals: ~3m early + ~1m final reply.\nResults: official Kalshi settlement.\nControl modes: Signal Only / Paper Auto Trade / Live Auto Trade (live remains safety-locked until verified API support).')
+    notifier=Telegram(token,chat); runner=Runner(KalshiPublic(),notifier,'data/kalshi_btc_eth_15m.sqlite',env)
+    notifier.send_text('🟢 KALSHI BTC/ETH 15M SIGNAL BOT RUNNING\n\nPrimary source: Kalshi production public market data.\nSignals: ~3m early + ~1m final reply.\nResults: official Kalshi settlement.\nControl modes: Signal Only / Paper Auto Trade / Kalshi Live Auto Trade.')
     logging.info('KALSHI BTC/ETH 15M BOT STARTED | interval=%ss',args.interval)
     while True:
         try: runner.cycle()

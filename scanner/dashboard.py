@@ -14,7 +14,7 @@ def login_page(error=''):
     return f'''<!doctype html><html><head><meta name="viewport" content="width=device-width"><title>Bot Dashboard Login</title><style>{CSS}</style></head><body><div class="card login"><h2>Prediction Bot Dashboard</h2><p class="sub">Enter your dashboard token to continue.</p>{msg}<form method="post" action="/login"><input style="width:100%;margin:8px 0" name="token" type="password" placeholder="Dashboard token" required autofocus><button style="width:100%;margin:8px 0">Login</button></form><p class="small">Keep this token private. For production use, put the dashboard behind HTTPS.</p></div></body></html>'''
 
 def page(s, rows, live):
-    safety='<span class="ok">Live connector explicitly verified.</span>' if live else '<span class="warn">Live Auto Trade is LOCKED. Coinbase Prediction Market programmatic Buy/Sell access has not been verified. Signal and Paper modes are available.</span>'
+    safety='<span class="ok">Kalshi Live Auto Trade is enabled.</span>' if live else '<span class="warn">Live mode needs KALSHI_API_KEY_ID, private key, and KALSHI_LIVE_TRADING=YES.</span>'
     total=sum(1 for _ in rows); paper=sum(1 for r in rows if str(r[5])=='PAPER'); pnl=sum(float(r[6] or 0) for r in rows)
     trs=''.join('<tr>'+''.join('<td>'+html.escape(str(v if v is not None else ''))+'</td>' for v in r)+'</tr>' for r in rows) or '<tr><td colspan="7" class="small">No execution records yet.</td></tr>'
     return f'''<!doctype html><html><head><meta name="viewport" content="width=device-width"><meta http-equiv="refresh" content="30"><title>Prediction Bot Control</title><style>{CSS}</style></head><body><form method="post" action="/logout"><button class="logout">Logout</button></form><h1>BTC/ETH 15M Bot Control</h1><div class="sub">Prediction Market signal & execution dashboard · auto refresh 30s</div><div class="grid"><div class="card"><div>Auto Execution</div><div class="metric {'ok' if s['enabled'] else 'warn'}">{'ON' if s['enabled'] else 'OFF'}</div></div><div class="card"><div>Mode</div><div class="metric">{html.escape(str(s['mode']).upper())}</div></div><div class="card"><div>Entry Amount</div><div class="metric">${float(s['amount_usd']):.2f}</div></div><div class="card"><div>Recent Records</div><div class="metric">{total}</div><div class="small">Paper: {paper} · PnL: ${pnl:.2f}</div></div></div><form class="card" method="post" action="/settings"><h3>Settings</h3><label>Mode <select name="mode"><option value="signal" {'selected' if s['mode']=='signal' else ''}>Signal Only</option><option value="paper" {'selected' if s['mode']=='paper' else ''}>Paper Auto Trade</option><option value="live" {'selected' if s['mode']=='live' else ''}>Live Auto Trade</option></select></label><label>Fixed amount $ <input name="amount" type="number" min="1" step="0.01" value="{float(s['amount_usd']):.2f}"></label><br><label><input type="checkbox" name="btc" {'checked' if s['btc'] else ''}> BTC</label><label><input type="checkbox" name="eth" {'checked' if s['eth'] else ''}> ETH</label><label><input type="checkbox" name="enabled" {'checked' if s['enabled'] else ''}> Auto execution ON</label><br><button>Save Settings</button></form><div class="card"><h3>Safety</h3>{safety}</div><div class="card"><h3>Recent execution report</h3><div style="overflow-x:auto"><table><tr><th>Coin</th><th>Stage</th><th>Action</th><th>Direction</th><th>$</th><th>Status</th><th>PnL</th></tr>{trs}</table></div></div></body></html>'''
@@ -44,7 +44,7 @@ class H(BaseHTTPRequestHandler):
             self.send_html('OK'); return
         if not self.authed(): self.send_html(login_page()); return
         c=Control(self.server.db); s=c.get(); rows=list(c.db.execute('SELECT coin,stage,action,direction,amount,status,pnl FROM trade_log ORDER BY id DESC LIMIT 50'))
-        live=os.environ.get('COINBASE_PREDICTION_LIVE_VERIFIED')=='YES'; self.send_html(page(s,rows,live))
+        live=bool(os.environ.get('KALSHI_API_KEY_ID') and (os.environ.get('KALSHI_PRIVATE_KEY_PATH') or os.environ.get('KALSHI_PRIVATE_KEY')) and os.environ.get('KALSHI_LIVE_TRADING','').upper()=='YES'); self.send_html(page(s,rows,live))
     def do_POST(self):
         if self.path=='/login':
             q=self.form(); supplied=q.get('token',[''])[0]; tok=self.token()
@@ -57,7 +57,7 @@ class H(BaseHTTPRequestHandler):
         if self.path=='/settings':
             q=self.form(); mode=q.get('mode',['signal'])[0]
             if mode not in ('signal','paper','live'): mode='signal'
-            if mode=='live' and os.environ.get('COINBASE_PREDICTION_LIVE_VERIFIED')!='YES': mode='paper'
+            if mode=='live' and not (os.environ.get('KALSHI_API_KEY_ID') and (os.environ.get('KALSHI_PRIVATE_KEY_PATH') or os.environ.get('KALSHI_PRIVATE_KEY')) and os.environ.get('KALSHI_LIVE_TRADING','').upper()=='YES'): mode='paper'
             try: amt=max(1.0,float(q.get('amount',['10'])[0]))
             except: amt=10.0
             Control(self.server.db).set(mode=mode,amount_usd=amt,btc='btc' in q,eth='eth' in q,enabled='enabled' in q); self.redirect('/'); return
